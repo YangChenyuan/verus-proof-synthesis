@@ -6,6 +6,7 @@ import os
 import argparse
 import logging
 import json
+import shlex
 import utils
 from utils import AttrDict
 from veval import verus
@@ -53,6 +54,12 @@ def main():
     parser.add_argument(
         "--disable-one-refinement", type=int, default=-1, help="Disable one refinement"
     )
+    parser.add_argument(
+        "--verus-args",
+        type=str,
+        default="",
+        help='Additional arguments to pass to Verus as a single string (e.g., "-L dependency=path --extern=name=path")',
+    )
 
     args = parser.parse_args()
     # Set log level.
@@ -77,6 +84,12 @@ def main():
     config = json.load(open(args.config))
     config = AttrDict(config)
     verus.set_verus_path(config.verus_path)
+
+    # Set additional verus arguments globally
+    verus_args = []
+    if args.verus_args:
+        verus_args = shlex.split(args.verus_args)
+    verus.set_additional_args(verus_args)
 
     # Config
     if args.disable_safe:

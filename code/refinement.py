@@ -4,8 +4,10 @@
 
 import os
 import time
+from pathlib import Path
 from infer import LLM
 from houdini import houdini
+from llm_utils import call_llm_with_search_replace_format
 from utils import (
     clean_code,
     code_change_is_safe,
@@ -24,6 +26,10 @@ class Refinement:
         self.logger = logger
         self.hdn = houdini(config)
         self.default_system = "You are an experienced formal language programmer. You are very familiar with Verus, which is a tool for verifying the correctness of code written in Rust."
+
+        # Create prompt directory for logging
+        self.llm_prompt_dir = Path("llm-prompts")
+        self.llm_prompt_dir.mkdir(parents=True, exist_ok=True)
 
         # Proof block knowledge
         self.proof_block_info = """The proof block looks like this:
@@ -60,6 +66,41 @@ Note, please DO NOT modify all other proof blocks that are not related to the er
                 instruction += "\n\n" + self.seq_knowledge
                 break
         return instruction
+
+    def call_llm_with_search_replace(
+        self,
+        engine: str,
+        instruction: str,
+        query: str,
+        system: str,
+        original_code: str,
+        examples=None,
+        answer_num: int = 1,
+        max_tokens: int = 4096,
+        temp: float = 1.0,
+    ):
+        """
+        Wrapper method to call LLM with SEARCH/REPLACE format for refinement operations.
+
+        This uses the search-replace format which is more precise than returning full code.
+        """
+        if examples is None:
+            examples = []
+
+        return call_llm_with_search_replace_format(
+            llm=self.llm,
+            logger=self.logger,
+            llm_prompt_dir=self.llm_prompt_dir,
+            engine=engine,
+            instruction=instruction,
+            query=query,
+            system=system,
+            original_code=original_code,
+            examples=examples,
+            answer_num=answer_num,
+            max_tokens=max_tokens,
+            temp=temp,
+        )
 
     def debug_type_error(self, code: str, verus_error: VerusError = None, num=1) -> str:
         """
@@ -173,7 +214,7 @@ Note, please DO NOT modify all other proof blocks that are not related to the er
             + errline
             + "'. Your mission is to rewrite this expression `"
             + errline
-            + "' to fix the syntax error. Please make sure to change that wrong expression and do not change any other part of the code. Response with the Rust code only, do not include any explanation. Please use a comment to explain what changes you have made to fix this syntax error."
+            + "' to fix the syntax error. Please make sure to change that wrong expression and do not change any other part of the code."
         )
 
         seq_knowledge = (
@@ -192,12 +233,13 @@ Note, please DO NOT modify all other proof blocks that are not related to the er
         with open("seqsyntax-query.txt", "w") as f:
             f.write(query)
 
-        return self.llm.infer_llm(
-            self.config.aoai_debug_model,
-            instruction,
-            examples,
-            query,
-            system,
+        return self.call_llm_with_search_replace(
+            engine=self.config.aoai_debug_model,
+            instruction=instruction,
+            query=query,
+            system=system,
+            original_code=code,
+            examples=examples,
             answer_num=num,
             max_tokens=4096,
             temp=temp,
@@ -223,16 +265,20 @@ Note, please DO NOT modify all other proof blocks that are not related to the er
             query_template = "Failed assertion\n```\n{}```\n"
             query_template += "\nCode\n```\n{}```\n"
             query = query_template.format(assertion_info, code)
-            output = self.llm.infer_llm(
-                self.config.aoai_debug_model,
-                instruction,
-                examples,
-                query,
-                self.default_system,
+            outputs = self.call_llm_with_search_replace(
+                engine=self.config.aoai_debug_model,
+                instruction=instruction,
+                query=query,
+                system=self.default_system,
+                original_code=code,
+                examples=examples,
                 answer_num=num,
                 max_tokens=4096,
                 temp=temp,
-            )[0]
+            )
+            if not outputs:
+                return ""
+            output = outputs[0]
             newcode = clean_code(output)
             newcode, _ = self.debug_type_error(newcode)
             if newcode:
@@ -405,12 +451,13 @@ Please check the given program, and add nonlinear_arith assertion for the follow
             instruction += "{}. Lines {}-{}:\n{}\n".format(i + 1, st, ed, text)
 
         examples = []
-        return self.llm.infer_llm(
-            self.config.aoai_debug_model,
-            instruction,
-            examples,
-            code,
-            system,
+        return self.call_llm_with_search_replace(
+            engine=self.config.aoai_debug_model,
+            instruction=instruction,
+            query=code,
+            system=system,
+            original_code=code,
+            examples=examples,
             answer_num=num,
             max_tokens=4096,
             temp=temp,
@@ -433,9 +480,7 @@ Please check the given program, and add nonlinear_arith assertion for the follow
 
         # Normal route of assertion fixing
         system = self.default_system
-        instruction = """Your mission is to fix the assertion error for the following code. Basically, you should either introduce the necessary proof blocks before the location where the assertion fails, or, if the assertion is within a loop or after a loop, you may need to add appropriate loop invariants to ensure the assertion holds true.
-
-Response with the Rust code only, do not include any explanation."""
+        instruction = """Your mission is to fix the assertion error for the following code. Basically, you should either introduce the necessary proof blocks before the location where the assertion fails, or, if the assertion is within a loop or after a loop, you may need to add appropriate loop invariants to ensure the assertion holds true."""
 
         instruction = self.add_seq_knowledge(code, instruction)
         examples = self.get_examples("assert")
@@ -450,12 +495,13 @@ Response with the Rust code only, do not include any explanation."""
         with open("assert-query.txt", "w") as f:
             f.write(query)
 
-        return self.llm.infer_llm(
-            self.config.aoai_debug_model,
-            instruction,
-            examples,
-            query,
-            system,
+        return self.call_llm_with_search_replace(
+            engine=self.config.aoai_debug_model,
+            instruction=instruction,
+            query=query,
+            system=system,
+            original_code=code,
+            examples=examples,
             answer_num=num,
             max_tokens=4096,
             temp=temp,
@@ -492,12 +538,13 @@ Response with the Rust code only, do not include any explanation."""
         assertion_info = error_trace.get_text() + "\n"
         query = query_template.format(assertion_info, code)
 
-        return self.llm.infer_llm(
-            self.config.aoai_generation_model,
-            instruction,
-            examples,
-            query,
-            system,
+        return self.call_llm_with_search_replace(
+            engine=self.config.aoai_generation_model,
+            instruction=instruction,
+            query=query,
+            system=system,
+            original_code=code,
+            examples=examples,
             answer_num=num,
             max_tokens=4096,
             temp=temp,
@@ -508,10 +555,8 @@ Response with the Rust code only, do not include any explanation."""
     ) -> str:
         system = self.default_system
         instruction = """Your mission is to fix the assertion error for the following code by creating the helper proof functions.
-        
-        Basically, you should determine what proof functions are needed to prove the current failed assertion, based on the related invariants already had. Then generate them and their invocations in the code just before the assertion.
 
-Response with the Rust code only, do not include any explanation."""
+        Basically, you should determine what proof functions are needed to prove the current failed assertion, based on the related invariants already had. Then generate them and their invocations in the code just before the assertion."""
         instruction = self.add_seq_knowledge(code, instruction)
 
         examples = self.get_examples("proof-func-middle")
@@ -522,12 +567,13 @@ Response with the Rust code only, do not include any explanation."""
         assertion_info = error_trace.get_text() + "\n"
         query = query_template.format(assertion_info, code)
 
-        return self.llm.infer_llm(
-            self.config.aoai_generation_model,
-            instruction,
-            examples,
-            query,
-            system,
+        return self.call_llm_with_search_replace(
+            engine=self.config.aoai_generation_model,
+            instruction=instruction,
+            query=query,
+            system=system,
+            original_code=code,
+            examples=examples,
             answer_num=num,
             max_tokens=4096,
             temp=temp,
@@ -537,9 +583,7 @@ Response with the Rust code only, do not include any explanation."""
         self, code: str, verus_error: VerusError, num=1, temp=1.0
     ) -> str:
         system = self.default_system
-        instruction = """Your mission is to fix the precondition not satisfied error for the following code. Basically, you should add the proof blocks related to the pre-condition check just before the invocation of the function. Note, DO NOT change the proof function whose pre-condition is not satisfied. You can use the pre-conditions of the current function, invariants of the current loop, and the pre-conditions of the called functions to fix the error.
-
-Response with the Rust code only, do not include any explanation."""
+        instruction = """Your mission is to fix the precondition not satisfied error for the following code. Basically, you should add the proof blocks related to the pre-condition check just before the invocation of the function. Note, DO NOT change the proof function whose pre-condition is not satisfied. You can use the pre-conditions of the current function, invariants of the current loop, and the pre-conditions of the called functions to fix the error."""
         instruction += "\n\n" + self.proof_block_info
         instruction = self.add_seq_knowledge(code, instruction)
 
@@ -560,12 +604,13 @@ Response with the Rust code only, do not include any explanation."""
         with open("precond-query.txt", "w") as f:
             f.write(query)
 
-        return self.llm.infer_llm(
-            self.config.aoai_generation_model,
-            instruction,
-            examples,
-            query,
-            system,
+        return self.call_llm_with_search_replace(
+            engine=self.config.aoai_generation_model,
+            instruction=instruction,
+            query=query,
+            system=system,
+            original_code=code,
+            examples=examples,
             answer_num=num,
             max_tokens=4096,
             temp=temp,
@@ -606,12 +651,13 @@ Response with the Rust code only, do not include any explanation."""
         with open("precond-query.txt", "w") as f:
             f.write(query)
 
-        return self.llm.infer_llm(
-            self.config.aoai_generation_model,
-            instruction,
-            examples,
-            query,
-            system,
+        return self.call_llm_with_search_replace(
+            engine=self.config.aoai_generation_model,
+            instruction=instruction,
+            query=query,
+            system=system,
+            original_code=code,
+            examples=examples,
             answer_num=num,
             max_tokens=4096,
             temp=temp,
@@ -625,9 +671,7 @@ Response with the Rust code only, do not include any explanation."""
 
 1. Add the proof blocks related to the post-condition at or just before the exit point where the post-condition failure occurred.
 2. Modify the existing loop invariants to make them work for the post-condition.
-3. If the function ends with a loop, make sure there is a loop invariant in that loop that reflects the post-condition `{verus_error.trace[0].get_highlights()[0]}'.
-
-Response with the Rust code only, do not include any explanation."""
+3. If the function ends with a loop, make sure there is a loop invariant in that loop that reflects the post-condition `{verus_error.trace[0].get_highlights()[0]}'."""
         instruction += "\n\n" + self.proof_block_info
         instruction = self.add_seq_knowledge(code, instruction)
 
@@ -649,12 +693,13 @@ Response with the Rust code only, do not include any explanation."""
         with open("postcond-query.txt", "w") as f:
             f.write(query)
 
-        return self.llm.infer_llm(
-            self.config.aoai_generation_model,
-            instruction,
-            examples,
-            query,
-            system,
+        return self.call_llm_with_search_replace(
+            engine=self.config.aoai_generation_model,
+            instruction=instruction,
+            query=query,
+            system=system,
+            original_code=code,
+            examples=examples,
             answer_num=num,
             max_tokens=4096,
             temp=temp,
@@ -682,12 +727,13 @@ Response with the Rust code only, do not include any explanation."""
 
             examples = []
 
-            return self.llm.infer_llm(
-                self.config.aoai_debug_model,
-                instruction,
-                examples,
-                query,
-                system,
+            return self.call_llm_with_search_replace(
+                engine=self.config.aoai_debug_model,
+                instruction=instruction,
+                query=query,
+                system=system,
+                original_code=code,
+                examples=examples,
                 answer_num=num,
                 max_tokens=4096,
                 temp=temp,
@@ -699,17 +745,22 @@ Response with the Rust code only, do not include any explanation."""
 
             examples = []
 
-            fix_code = self.llm.infer_llm(
-                self.config.aoai_debug_model,
-                instruction,
-                examples,
-                query,
-                system,
+            fix_codes = self.call_llm_with_search_replace(
+                engine=self.config.aoai_debug_model,
+                instruction=instruction,
+                query=query,
+                system=system,
+                original_code=code,
+                examples=examples,
                 answer_num=num,
                 max_tokens=4096,
                 temp=temp,
-            )[0]
-            fix_code = clean_code(fix_code)
+            )
+            if not fix_codes:
+                self.logger.info("[repair_invfail_front] No fix code generated")
+                fix_code = code
+            else:
+                fix_code = clean_code(fix_codes[0])
 
             self.logger.info("Here is the quick fix output")
             # DEBUG only
@@ -752,12 +803,13 @@ Response with the Rust code only, do not include any explanation."""
 
         examples = self.get_examples("inv-front")
 
-        return self.llm.infer_llm(
-            self.config.aoai_debug_model,
-            instruction,
-            examples,
-            query,
-            system,
+        return self.call_llm_with_search_replace(
+            engine=self.config.aoai_debug_model,
+            instruction=instruction,
+            query=query,
+            system=system,
+            original_code=code,
+            examples=examples,
             answer_num=num,
             max_tokens=4096,
             temp=temp,
@@ -767,9 +819,7 @@ Response with the Rust code only, do not include any explanation."""
         self, code: str, verus_error: VerusError, num=1, temp=1.0
     ) -> str:
         system = self.default_system
-        instruction = """Your mission is to fix the invariant not satisfied error at end of the loop for the following code. Basically, you should add the assertion (in proof block) of the failed loop invariant at the end of the loop. DO NOT change the existing proof functions. If you think the failed invariant is incorrect, you can delete/correct it.
-
-Response with the Rust code only, do not include any explanation."""
+        instruction = """Your mission is to fix the invariant not satisfied error at end of the loop for the following code. Basically, you should add the assertion (in proof block) of the failed loop invariant at the end of the loop. DO NOT change the existing proof functions. If you think the failed invariant is incorrect, you can delete/correct it."""
         instruction += "\n\n" + self.proof_block_info
         instruction = self.add_seq_knowledge(code, instruction)
 
@@ -782,12 +832,13 @@ Response with the Rust code only, do not include any explanation."""
         inv_info = line_info + error_trace.get_text() + "\n"
         query = query_template.format(inv_info, code)
 
-        return self.llm.infer_llm(
-            self.config.aoai_debug_model,
-            instruction,
-            examples,
-            query,
-            system,
+        return self.call_llm_with_search_replace(
+            engine=self.config.aoai_debug_model,
+            instruction=instruction,
+            query=query,
+            system=system,
+            original_code=code,
+            examples=examples,
             answer_num=num,
             max_tokens=4096,
             temp=temp,
@@ -842,12 +893,13 @@ Hint for the upper bound:
         with open("arith-query.txt", "w") as f:
             f.write(instruction)
 
-        return self.llm.infer_llm(
-            self.config.aoai_generation_model,
-            instruction,
-            examples,
-            query,
-            system,
+        return self.call_llm_with_search_replace(
+            engine=self.config.aoai_generation_model,
+            instruction=instruction,
+            query=query,
+            system=system,
+            original_code=code,
+            examples=examples,
             answer_num=num,
             max_tokens=4096,
             temp=temp,
@@ -881,12 +933,13 @@ Hint for the upper bound:
 
         query = query_template.format(error_text, code)
 
-        return self.llm.infer_llm(
-            self.config.aoai_generation_model,
-            instruction,
-            examples,
-            query,
-            system,
+        return self.call_llm_with_search_replace(
+            engine=self.config.aoai_generation_model,
+            instruction=instruction,
+            query=query,
+            system=system,
+            original_code=code,
+            examples=examples,
             answer_num=num,
             max_tokens=4096,
             temp=temp,
@@ -899,9 +952,7 @@ Hint for the upper bound:
         The default function to repair the code.
         """
         system = self.default_system
-        instruction = """Your mission is to fix the error for the following code. Basically, you should add/modify/delete the proof blocks, assertions and loop invariants related to the error.
-
-Response with the Rust code only, do not include any explanation."""
+        instruction = """Your mission is to fix the error for the following code. Basically, you should add/modify/delete the proof blocks, assertions and loop invariants related to the error."""
         instruction += "\n\n" + self.proof_block_info
         instruction = self.add_seq_knowledge(code, instruction)
 
@@ -922,12 +973,13 @@ Response with the Rust code only, do not include any explanation."""
             f.write(instruction + "\n")
             f.write(query)
 
-        return self.llm.infer_llm(
-            self.config.aoai_generation_model,
-            instruction,
-            examples,
-            query,
-            system,
+        return self.call_llm_with_search_replace(
+            engine=self.config.aoai_generation_model,
+            instruction=instruction,
+            query=query,
+            system=system,
+            original_code=code,
+            examples=examples,
             answer_num=num,
             max_tokens=4096,
             temp=temp,

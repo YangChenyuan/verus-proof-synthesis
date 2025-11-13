@@ -75,18 +75,20 @@ VerusErrorLabel2m = {v: k for k, v in m2VerusErrorLabel.items()}
 class Verus:
     def __init__(self):
         self.verus_path = None
+        self.additional_args = []
 
     def set_verus_path(self, path):
         self.verus_path = os.path.realpath(path)
         self.vstd_path = os.path.realpath(
             os.path.join(self.verus_path, "../../../vstd/")
         )
-        # print(f"verus path: {self.verus_path}")
-        # print(f"vstd path: {self.vstd_path}")
+
+    def set_additional_args(self, args):
+        """Set additional arguments to pass to Verus"""
+        self.additional_args = args or []
 
 
 verus = Verus()
-verus.set_verus_path(shutil.which("verus"))
 
 class ErrorText:
     def __init__(self, text):
@@ -302,39 +304,57 @@ class VEval:
         cmd += [code_path]
         if func_name:
             cmd += ["--verify-function", func_name, "--verify-root"]
+
+        cmd += ["--rlimit", "300"]
+        # Add additional arguments if provided
+        if verus.additional_args:
+            cmd.extend(verus.additional_args)
+
         # self.logger.info(f"Running command: {cmd}")
-        m = subprocess.run(cmd, capture_output=True, text=True)
-        verus_out = m.stdout
-        rustc_out = m.stderr
-        os.unlink(code_path)
-
-        self.verus_out = verus_out
-        self.rustc_out = rustc_out
-
-        if not json_mode:
-            return
-
         try:
-            self.verus_result = json.loads(verus_out)
-        except json.JSONDecodeError as e:
-            self.verus_result = None
+            m = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+            verus_out = m.stdout
+            rustc_out = m.stderr
+            os.unlink(code_path)
 
-        # If verus succeed, but rustc failed, then it is a compilation error.
-        if self.verus_succeed() and m.returncode != 0:
-            self.compilation_error = True
+            self.verus_out = verus_out
+            self.rustc_out = rustc_out
 
-        for rust_err in rustc_out.split("\n")[:-1]:
+            if not json_mode:
+                return
+
             try:
-                e = json.loads(rust_err)
+                self.verus_result = json.loads(verus_out)
             except json.JSONDecodeError as e:
-                continue
-            if not isinstance(e, dict):
-                self.logger.error(f"Unexpected rust err output: {e}")
-                continue
-            self.rustc_result.append(e)
-            if "level" in e and e["level"] == "error":
-                if "message" in e and "aborting due to" not in e["message"]:
-                    self.verus_errors.append(VerusError(e))
+                self.verus_result = None
+
+            # If verus succeed, but rustc failed, then it is a compilation error.
+            if self.verus_succeed() and m.returncode != 0:
+                self.compilation_error = True
+
+            for rust_err in rustc_out.split("\n")[:-1]:
+                try:
+                    e = json.loads(rust_err)
+                except json.JSONDecodeError as e:
+                    continue
+                if not isinstance(e, dict):
+                    self.logger.error(f"Unexpected rust err output: {e}")
+                    continue
+                self.rustc_result.append(e)
+                if "level" in e and e["level"] == "error":
+                    if "message" in e and "aborting due to" not in e["message"]:
+                        self.verus_errors.append(VerusError(e))
+        except subprocess.TimeoutExpired:
+            verus_out = None
+            rustc_out = None
+            self.verus_result = None
+            self.compilation_error = False
+            self.logger.warning("Killed verification attempt after timer expired")
+            # Clean up temporary file in case of timeout
+            try:
+                os.unlink(code_path)
+            except:
+                pass  # File might already be deleted
 
     # Returns the number of verifed functions.
     def get_verified(self) -> int:

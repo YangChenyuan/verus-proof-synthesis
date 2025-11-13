@@ -82,6 +82,23 @@ def code_change_is_safe(
         logger.warning("Debug mode is on, skip code change checking")
         return True
 
+    # Check the number of admit(), assume(, #[verifier::external_body]
+    # They should not be increased
+    if origin.count("admit()") != changed.count("admit()"):
+        logger.error("admit() calls have been added or removed")
+        return False
+    if origin.count("assume(") != changed.count("assume("):
+        logger.error("assume(...) calls have been added or removed")
+        return False
+    if origin.count("#[verifier::external_body]") != changed.count(
+        "#[verifier::external_body]"
+    ):
+        logger.error("#[verifier::external_body] annotations have been added or removed")
+        return False
+    if origin.count("#[verifier::admit]") != changed.count("#[verifier::admit]"):
+        logger.error("#[verifier::admit] annotations have been added or removed")
+        return False
+
     orig_f = tempfile.NamedTemporaryFile(
         mode="w", delete=False, prefix="llm4v_orig", suffix=".rs"
     )
